@@ -21,7 +21,7 @@ import { OutputInfoCollector } from './outputInfoCollector';
 import { collectJavaExtensions, getBundlesToReload, isContributedPartUpdated } from './plugin';
 import { registerClientProviders } from './providerDispatcher';
 import { initialize as initializeRecommendation } from './recommendation';
-import * as requirements from './requirements';
+import { RequirementsData, resolveRequirements } from './requirements';
 import { runtimeStatusBarProvider } from './runtimeStatusBarProvider';
 import { serverStatusBarProvider } from './serverStatusBarProvider';
 import { ACTIVE_BUILD_TOOL_STATE, cleanWorkspaceFileName, getJavaServerMode, handleTextBlockClosing, onConfigurationChange, ServerMode } from './settings';
@@ -76,7 +76,7 @@ function getHeapDumpFolderFromSettings(): string {
 }
 
 
-export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
+export async function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 	context.subscriptions.push(markdownPreviewProvider);
 	context.subscriptions.push(commands.registerCommand(Commands.TEMPLATE_VARIABLES, async () => {
 		markdownPreviewProvider.show(context.asAbsolutePath(path.join('document', `${Commands.TEMPLATE_VARIABLES}.md`)), 'Predefined Variables', "", context);
@@ -108,7 +108,10 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 
 	serverStatusBarProvider.initialize();
 
-	return requirements.resolveRequirements(context).catch(error => {
+	let requirements: RequirementsData | null = null;
+	try {
+		requirements = await resolveRequirements(context);
+	} catch (error) {
 		// show error
 		window.showErrorMessage(error.message, error.label).then((selection) => {
 			if (error.label && error.label === selection && error.command) {
@@ -117,301 +120,321 @@ export function activate(context: ExtensionContext): Promise<ExtensionAPI> {
 		});
 		// rethrow to disrupt the chain.
 		throw error;
-	}).then(async (requirements) => {
-		const triggerFiles = await getTriggerFiles();
-		return new Promise<ExtensionAPI>(async (resolve) => {
-			const workspacePath = path.resolve(`${storagePath}/jdt_ws`);
-			const syntaxServerWorkspacePath = path.resolve(`${storagePath}/ss_ws`);
+	}
+	const triggerFiles = await getTriggerFiles();
+	const workspacePath = path.resolve(`${storagePath}/jdt_ws`);
+	const syntaxServerWorkspacePath = path.resolve(`${storagePath}/ss_ws`);
 
-			let serverMode = getJavaServerMode();
-			const isWorkspaceTrusted = (workspace as any).isTrusted; // TODO: use workspace.isTrusted directly when other clients catch up to adopt 1.56.0
-			if (isWorkspaceTrusted !== undefined && !isWorkspaceTrusted) { // keep compatibility for old engines < 1.56.0
-				serverMode = ServerMode.lightWeight;
-			}
-			commands.executeCommand('setContext', 'java:serverMode', serverMode);
-			const isDebugModeByClientPort = !!process.env['SYNTAXLS_CLIENT_PORT'] || !!process.env['JDTLS_CLIENT_PORT'];
-			const requireSyntaxServer = (serverMode !== ServerMode.standard) && (!isDebugModeByClientPort || !!process.env['SYNTAXLS_CLIENT_PORT']);
-			let requireStandardServer = (serverMode !== ServerMode.lightWeight) && (!isDebugModeByClientPort || !!process.env['JDTLS_CLIENT_PORT']);
+	let serverMode = getJavaServerMode();
+	const isWorkspaceTrusted = (workspace as any).isTrusted; // TODO: use workspace.isTrusted directly when other clients catch up to adopt 1.56.0
+	if (isWorkspaceTrusted !== undefined && !isWorkspaceTrusted) { // keep compatibility for old engines < 1.56.0
+		serverMode = ServerMode.lightWeight;
+	}
+	commands.executeCommand('setContext', 'java:serverMode', serverMode);
+	const isDebugModeByClientPort = !!process.env['SYNTAXLS_CLIENT_PORT'] || !!process.env['JDTLS_CLIENT_PORT'];
+	const requireSyntaxServer = (serverMode !== ServerMode.standard) && (!isDebugModeByClientPort || !!process.env['SYNTAXLS_CLIENT_PORT']);
+	let requireStandardServer = (serverMode !== ServerMode.lightWeight) && (!isDebugModeByClientPort || !!process.env['JDTLS_CLIENT_PORT']);
 
-			// Options to control the language client
-			const clientOptions: LanguageClientOptions = {
-				// Register the server for java
-				documentSelector: [
-					{ scheme: 'file', language: 'java' },
-					{ scheme: 'jdt', language: 'java' },
-					{ scheme: 'untitled', language: 'java' }
-				],
-				synchronize: {
-					configurationSection: ['java', 'editor.insertSpaces', 'editor.tabSize'],
-				},
-				initializationOptions: {
-					bundles: collectJavaExtensions(extensions.all),
-					workspaceFolders: workspace.workspaceFolders ? workspace.workspaceFolders.map(f => f.uri.toString()) : null,
-					settings: { java: getJavaConfig(requirements.java_home) },
-					extendedClientCapabilities: {
-						progressReportProvider: getJavaConfiguration().get('progressReports.enabled'),
-						classFileContentsSupport: true,
-						overrideMethodsPromptSupport: true,
-						hashCodeEqualsPromptSupport: true,
-						advancedOrganizeImportsSupport: true,
-						generateToStringPromptSupport: true,
-						advancedGenerateAccessorsSupport: true,
-						generateConstructorsPromptSupport: true,
-						generateDelegateMethodsPromptSupport: true,
-						advancedExtractRefactoringSupport: true,
-						inferSelectionSupport: ["extractMethod", "extractVariable", "extractField"],
-						moveRefactoringSupport: true,
-						clientHoverProvider: true,
-						clientDocumentSymbolProvider: true,
-						gradleChecksumWrapperPromptSupport: true,
-						resolveAdditionalTextEditsSupport: true,
-						advancedIntroduceParameterRefactoringSupport: true,
-						actionableRuntimeNotificationSupport: true,
-						shouldLanguageServerExitOnShutdown: true,
-						onCompletionItemSelectedCommand: "editor.action.triggerParameterHints",
-					},
-					triggerFiles,
-				},
-				middleware: {
-					workspace: {
-						didChangeConfiguration: () => {
-							standardClient.getClient().sendNotification(DidChangeConfigurationNotification.type, {
-								settings: {
-									java: getJavaConfig(requirements.java_home),
-								}
-							});
+	// Options to control the language client
+	const clientOptions: LanguageClientOptions = {
+		// Register the server for java
+		documentSelector: [
+			{ scheme: 'file', language: 'java' },
+			{ scheme: 'jdt', language: 'java' },
+			{ scheme: 'untitled', language: 'java' }
+		],
+		synchronize: {
+			configurationSection: ['java', 'editor.insertSpaces', 'editor.tabSize'],
+		},
+		initializationOptions: {
+			bundles: collectJavaExtensions(extensions.all),
+			workspaceFolders: workspace.workspaceFolders ? workspace.workspaceFolders.map(f => f.uri.toString()) : null,
+			settings: { java: getJavaConfig(requirements.java_home) },
+			extendedClientCapabilities: {
+				progressReportProvider: getJavaConfiguration().get('progressReports.enabled'),
+				classFileContentsSupport: true,
+				overrideMethodsPromptSupport: true,
+				hashCodeEqualsPromptSupport: true,
+				advancedOrganizeImportsSupport: true,
+				generateToStringPromptSupport: true,
+				advancedGenerateAccessorsSupport: true,
+				generateConstructorsPromptSupport: true,
+				generateDelegateMethodsPromptSupport: true,
+				advancedExtractRefactoringSupport: true,
+				inferSelectionSupport: ["extractMethod", "extractVariable", "extractField"],
+				moveRefactoringSupport: true,
+				clientHoverProvider: true,
+				clientDocumentSymbolProvider: true,
+				gradleChecksumWrapperPromptSupport: true,
+				resolveAdditionalTextEditsSupport: true,
+				advancedIntroduceParameterRefactoringSupport: true,
+				actionableRuntimeNotificationSupport: true,
+				shouldLanguageServerExitOnShutdown: true,
+				onCompletionItemSelectedCommand: "editor.action.triggerParameterHints",
+			},
+			triggerFiles,
+		},
+		middleware: {
+			workspace: {
+				didChangeConfiguration: () => {
+					standardClient.getClient().sendNotification(DidChangeConfigurationNotification.type, {
+						settings: {
+							java: getJavaConfig(requirements.java_home),
 						}
-					},
-					// https://github.com/redhat-developer/vscode-java/issues/2130
-					// include all diagnostics for the current line in the CodeActionContext params for the performance reason
-					provideCodeActions: (document, range, context, token, next) => {
-						const client: LanguageClient = standardClient.getClient();
-						const params: CodeActionParams = {
-							textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(document),
-							range: client.code2ProtocolConverter.asRange(range),
-							context: client.code2ProtocolConverter.asCodeActionContext(context)
-						};
-						const showAt  = getJavaConfiguration().get<string>("quickfix.showAt");
-						if (showAt === 'line' && range.start.line === range.end.line && range.start.character === range.end.character) {
-							const textLine = document.lineAt(params.range.start.line);
-							if (textLine !== null) {
-								const diagnostics = client.diagnostics.get(document.uri);
-								const allDiagnostics: Diagnostic[] = [];
-								for (const diagnostic of diagnostics) {
-									if (textLine.range.intersection(diagnostic.range)) {
-										const newLen = allDiagnostics.push(diagnostic);
-										if (newLen > 1000) {
-											break;
-										}
-									}
-								}
-								const codeActionContext: CodeActionContext = {
-									diagnostics: allDiagnostics,
-									only: context.only,
-									triggerKind: CodeActionTriggerKind.Invoke,
-								};
-								params.context = client.code2ProtocolConverter.asCodeActionContext(codeActionContext);
-							}
-						}
-						return client.sendRequest(CodeActionRequest.type, params, token).then((values) => {
-							if (values === null) {
-								return undefined;
-							}
-							const result = [];
-							for (const item of values) {
-								if (Command.is(item)) {
-									result.push(client.protocol2CodeConverter.asCommand(item));
-								}
-								else {
-									result.push(client.protocol2CodeConverter.asCodeAction(item));
-								}
-							}
-							return result;
-						}, (error) => {
-							return client.handleFailedRequest(CodeActionRequest.type, token, error, []);
-						});
-					}
-				},
-				revealOutputChannelOn: RevealOutputChannelOn.Never,
-				errorHandler: new ClientErrorHandler(extensionName),
-				initializationFailedHandler: error => {
-					logger.error(`Failed to initialize ${extensionName} due to ${error && error.toString()}`);
-					return true;
-				},
-				outputChannel: requireStandardServer ? new OutputInfoCollector(extensionName) : undefined,
-				outputChannelName: extensionName
-			};
-
-			apiManager.initialize(requirements, serverMode);
-
-			if (requireSyntaxServer) {
-				if (process.env['SYNTAXLS_CLIENT_PORT']) {
-					syntaxClient.initialize(requirements, clientOptions, resolve);
-				} else {
-					syntaxClient.initialize(requirements, clientOptions, resolve, prepareExecutable(requirements, syntaxServerWorkspacePath, getJavaConfig(requirements.java_home), context, true));
+					});
 				}
-				syntaxClient.start();
-				serverStatusBarProvider.showLightWeightStatus();
-			}
-
-			context.subscriptions.push(commands.registerCommand(Commands.EXECUTE_WORKSPACE_COMMAND, (command, ...rest) => {
-				const api: ExtensionAPI = apiManager.getApiInstance();
-				if (api.serverMode === ServerMode.lightWeight) {
-					console.warn(`The command: ${command} is not supported in LightWeight mode. See: https://github.com/redhat-developer/vscode-java/issues/1480`);
-					return;
-				}
-				let token: CancellationToken;
-				let commandArgs: any[] = rest;
-				if (rest && rest.length && CancellationToken.is(rest[rest.length - 1])) {
-					token = rest[rest.length - 1];
-					commandArgs = rest.slice(0, rest.length - 1);
-				}
-				const params: ExecuteCommandParams = {
-					command,
-					arguments: commandArgs
+			},
+			// https://github.com/redhat-developer/vscode-java/issues/2130
+			// include all diagnostics for the current line in the CodeActionContext params for the performance reason
+			provideCodeActions: (document, range, context, token, next) => {
+				const client: LanguageClient = standardClient.getClient();
+				const params: CodeActionParams = {
+					textDocument: client.code2ProtocolConverter.asTextDocumentIdentifier(document),
+					range: client.code2ProtocolConverter.asRange(range),
+					context: client.code2ProtocolConverter.asCodeActionContext(context)
 				};
-				if (token) {
-					return standardClient.getClient().sendRequest(ExecuteCommandRequest.type, params, token);
-				} else {
-					return standardClient.getClient().sendRequest(ExecuteCommandRequest.type, params);
-				}
-			}));
-
-			const cleanWorkspaceExists = fs.existsSync(path.join(workspacePath, cleanWorkspaceFileName));
-			if (cleanWorkspaceExists) {
-				try {
-					cleanupLombokCache(context);
-					deleteDirectory(workspacePath);
-					deleteDirectory(syntaxServerWorkspacePath);
-				} catch (error) {
-					window.showErrorMessage(`Failed to delete ${workspacePath}: ${error}`);
-				}
-			}
-
-			// Register commands here to make it available even when the language client fails
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_LOG, (column: ViewColumn) => openServerLogFile(workspacePath, column)));
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDOUT_LOG, (column: ViewColumn) => openRollingServerLogFile(workspacePath, '.out-jdt.ls', column)));
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDERR_LOG, (column: ViewColumn) => openRollingServerLogFile(workspacePath, '.error-jdt.ls', column)));
-
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_CLIENT_LOG, (column: ViewColumn) => openClientLogFile(clientLogFile, column)));
-
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_LOGS, () => openLogs()));
-
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_FORMATTER, async () => openFormatter(context.extensionPath)));
-			context.subscriptions.push(commands.registerCommand(Commands.OPEN_FILE, async (uri: string) => {
-				const parsedUri = Uri.parse(uri);
-				await window.showTextDocument(parsedUri);
-			}));
-
-			context.subscriptions.push(commands.registerCommand(Commands.CLEAN_WORKSPACE, (force?: boolean) => cleanWorkspace(workspacePath, force)));
-			context.subscriptions.push(commands.registerCommand(Commands.CLEAN_SHARED_INDEXES, () => cleanSharedIndexes(context)));
-
-			context.subscriptions.push(commands.registerCommand(Commands.GET_WORKSPACE_PATH, () => workspacePath));
-
-			context.subscriptions.push(commands.registerCommand(Commands.REFRESH_BUNDLES_COMMAND, () => {
-				return getBundlesToReload();
-			}));
-
-			context.subscriptions.push(onConfigurationChange(workspacePath, context));
-
-			/**
-			 * Command to switch the server mode. Currently it only supports switch from lightweight to standard.
-			 * @param force force to switch server mode without asking
-			 */
-			commands.registerCommand(Commands.SWITCH_SERVER_MODE, async (switchTo: ServerMode, force: boolean = false) => {
-				const isWorkspaceTrusted = (workspace as any).isTrusted;
-				if (isWorkspaceTrusted !== undefined && !isWorkspaceTrusted) { // keep compatibility for old engines < 1.56.0
-					const button = "Manage Workspace Trust";
-					const choice = await window.showInformationMessage("For security concern, Java language server cannot be switched to Standard mode in untrusted workspaces.", button);
-					if (choice === button) {
-						commands.executeCommand("workbench.trust.manage");
-					}
-					return;
-				}
-
-				const clientStatus: ClientStatus = standardClient.getClientStatus();
-				if (clientStatus === ClientStatus.starting || clientStatus === ClientStatus.started) {
-					return;
-				}
-
-				const api: ExtensionAPI = apiManager.getApiInstance();
-				if (api.serverMode === switchTo || api.serverMode === ServerMode.standard) {
-					return;
-				}
-
-				let choice: string;
-				if (force) {
-					choice = "Yes";
-				} else {
-					choice = await window.showInformationMessage("Are you sure you want to switch the Java language server to Standard mode?", "Yes", "No");
-				}
-
-				if (choice === "Yes") {
-					await startStandardServer(context, requirements, clientOptions, workspacePath, resolve);
-				}
-			});
-
-			context.subscriptions.push(snippetCompletionProvider.initialize());
-			context.subscriptions.push(serverStatusBarProvider);
-			context.subscriptions.push(runtimeStatusBarProvider);
-
-			registerClientProviders(context, { contentProviderEvent: jdtEventEmitter.event });
-
-			apiManager.getApiInstance().onDidServerModeChange((event: ServerMode) => {
-				if (event === ServerMode.standard) {
-					syntaxClient.stop();
-					fileEventHandler.setServerStatus(true);
-					runtimeStatusBarProvider.initialize(context);
-				}
-				commands.executeCommand('setContext', 'java:serverMode', event);
-			});
-
-			if (serverMode === ServerMode.hybrid && !await fse.pathExists(path.join(workspacePath, ".metadata", ".plugins"))) {
-				const config = getJavaConfiguration();
-				const importOnStartupSection: string = "project.importOnFirstTimeStartup";
-				const importOnStartup = config.get(importOnStartupSection);
-				if (importOnStartup === "disabled" ||
-					env.uiKind === UIKind.Web && env.appName.includes("Visual Studio Code")) {
-					syntaxClient.resolveApi(resolve);
-					requireStandardServer = false;
-				} else if (importOnStartup === "interactive" && await workspaceContainsBuildFiles()) {
-					syntaxClient.resolveApi(resolve);
-					requireStandardServer = await promptUserForStandardServer(config);
-				} else {
-					requireStandardServer = true;
-				}
-			}
-
-			if (requireStandardServer) {
-				await startStandardServer(context, requirements, clientOptions, workspacePath, resolve);
-			}
-
-			const onDidGrantWorkspaceTrust = (workspace as any).onDidGrantWorkspaceTrust;
-			if (onDidGrantWorkspaceTrust !== undefined) { // keep compatibility for old engines < 1.56.0
-				context.subscriptions.push(onDidGrantWorkspaceTrust(() => {
-					if (getJavaServerMode() !== ServerMode.lightWeight) {
-						// See the issue https://github.com/redhat-developer/vscode-java/issues/1994
-						// Need to recollect the Java bundles before starting standard mode.
-						let pollingCount: number = 0;
-						// Poll every ~100ms (timeout after 1s) and check whether contributing javaExtensions have changed.
-						const intervalId = setInterval(() => {
-							const existingJavaExtensions = clientOptions.initializationOptions.bundles;
-							clientOptions.initializationOptions.bundles = collectJavaExtensions(extensions.all);
-							if (++pollingCount >= 10 || isContributedPartUpdated(existingJavaExtensions, clientOptions.initializationOptions.bundles)) {
-								clearInterval(intervalId);
-								commands.executeCommand(Commands.SWITCH_SERVER_MODE, ServerMode.standard, true);
-								return;
+				const showAt = getJavaConfiguration().get<string>("quickfix.showAt");
+				if (showAt === 'line' && range.start.line === range.end.line && range.start.character === range.end.character) {
+					const textLine = document.lineAt(params.range.start.line);
+					if (textLine !== null) {
+						const diagnostics = client.diagnostics.get(document.uri);
+						const allDiagnostics: Diagnostic[] = [];
+						for (const diagnostic of diagnostics) {
+							if (textLine.range.intersection(diagnostic.range)) {
+								const newLen = allDiagnostics.push(diagnostic);
+								if (newLen > 1000) {
+									break;
+								}
 							}
-						}, 100);
+						}
+						const codeActionContext: CodeActionContext = {
+							diagnostics: allDiagnostics,
+							only: context.only,
+							triggerKind: CodeActionTriggerKind.Invoke,
+						};
+						params.context = client.code2ProtocolConverter.asCodeActionContext(codeActionContext);
 					}
-				}));
+				}
+				return client.sendRequest(CodeActionRequest.type, params, token).then((values) => {
+					if (values === null) {
+						return undefined;
+					}
+					const result = [];
+					for (const item of values) {
+						if (Command.is(item)) {
+							result.push(client.protocol2CodeConverter.asCommand(item));
+						}
+						else {
+							result.push(client.protocol2CodeConverter.asCodeAction(item));
+						}
+					}
+					return result;
+				}, (error) => {
+					return client.handleFailedRequest(CodeActionRequest.type, token, error, []);
+				});
 			}
-			context.subscriptions.push(workspace.onDidChangeTextDocument(event => handleTextBlockClosing(event.document, event.contentChanges)));
-		});
+		},
+		revealOutputChannelOn: RevealOutputChannelOn.Never,
+		errorHandler: new ClientErrorHandler(extensionName),
+		initializationFailedHandler: error => {
+			logger.error(`Failed to initialize ${extensionName} due to ${error && error.toString()}`);
+			return true;
+		},
+		outputChannel: requireStandardServer ? new OutputInfoCollector(extensionName) : undefined,
+		outputChannelName: extensionName
+	};
+
+	apiManager.initialize(requirements, serverMode);
+
+	// the vscode-java extension api. whichever promise resolves first determines what is sent to the extensions.
+	let api: ExtensionAPI | null = null;
+	const apiPromises: Promise<void>[] = [];
+
+	if (requireSyntaxServer) {
+		if (process.env['SYNTAXLS_CLIENT_PORT']) {
+			apiPromises.push(syntaxClient.initialize(requirements, clientOptions).then((resolvedApi) => {
+				if (!api) {
+					api = resolvedApi;
+				}
+			}));
+		} else {
+			apiPromises.push(syntaxClient.initialize(requirements, clientOptions, prepareExecutable(requirements, syntaxServerWorkspacePath, getJavaConfig(requirements.java_home), context, true)).then((resolvedApi) => {
+				if (!api) {
+					api = resolvedApi;
+				}
+			}));
+		}
+		syntaxClient.start();
+		serverStatusBarProvider.showLightWeightStatus();
+	}
+
+	context.subscriptions.push(commands.registerCommand(Commands.EXECUTE_WORKSPACE_COMMAND, (command, ...rest) => {
+		const api: ExtensionAPI = apiManager.getApiInstance();
+		if (api.serverMode === ServerMode.lightWeight) {
+			console.warn(`The command: ${command} is not supported in LightWeight mode. See: https://github.com/redhat-developer/vscode-java/issues/1480`);
+			return;
+		}
+		let token: CancellationToken;
+		let commandArgs: any[] = rest;
+		if (rest && rest.length && CancellationToken.is(rest[rest.length - 1])) {
+			token = rest[rest.length - 1];
+			commandArgs = rest.slice(0, rest.length - 1);
+		}
+		const params: ExecuteCommandParams = {
+			command,
+			arguments: commandArgs
+		};
+		if (token) {
+			return standardClient.getClient().sendRequest(ExecuteCommandRequest.type, params, token);
+		} else {
+			return standardClient.getClient().sendRequest(ExecuteCommandRequest.type, params);
+		}
+	}));
+
+	const cleanWorkspaceExists = fs.existsSync(path.join(workspacePath, cleanWorkspaceFileName));
+	if (cleanWorkspaceExists) {
+		try {
+			cleanupLombokCache(context);
+			deleteDirectory(workspacePath);
+			deleteDirectory(syntaxServerWorkspacePath);
+		} catch (error_4) {
+			window.showErrorMessage(`Failed to delete ${workspacePath}: ${error_4}`);
+		}
+	}
+
+	// Register commands here to make it available even when the language client fails
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_LOG, (column: ViewColumn) => openServerLogFile(workspacePath, column)));
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDOUT_LOG, (column: ViewColumn) => openRollingServerLogFile(workspacePath, '.out-jdt.ls', column)));
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_SERVER_STDERR_LOG, (column: ViewColumn) => openRollingServerLogFile(workspacePath, '.error-jdt.ls', column)));
+
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_CLIENT_LOG, (column: ViewColumn) => openClientLogFile(clientLogFile, column)));
+
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_LOGS, () => openLogs()));
+
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_FORMATTER, async () => openFormatter(context.extensionPath)));
+	context.subscriptions.push(commands.registerCommand(Commands.OPEN_FILE, async (uri: string) => {
+		const parsedUri = Uri.parse(uri);
+		await window.showTextDocument(parsedUri);
+	}));
+
+	context.subscriptions.push(commands.registerCommand(Commands.CLEAN_WORKSPACE, (force?: boolean) => cleanWorkspace(workspacePath, force)));
+	context.subscriptions.push(commands.registerCommand(Commands.CLEAN_SHARED_INDEXES, () => cleanSharedIndexes(context)));
+
+	context.subscriptions.push(commands.registerCommand(Commands.GET_WORKSPACE_PATH, () => workspacePath));
+
+	context.subscriptions.push(commands.registerCommand(Commands.REFRESH_BUNDLES_COMMAND, () => {
+		return getBundlesToReload();
+	}));
+
+	context.subscriptions.push(onConfigurationChange(workspacePath, context));
+
+	/**
+	 * Command to switch the server mode. Currently it only supports switch from lightweight to standard.
+	 * @param force force to switch server mode without asking
+	 */
+	commands.registerCommand(Commands.SWITCH_SERVER_MODE, async (switchTo: ServerMode, force: boolean = false) => {
+		const isWorkspaceTrusted = (workspace as any).isTrusted;
+		if (isWorkspaceTrusted !== undefined && !isWorkspaceTrusted) { // keep compatibility for old engines < 1.56.0
+			const button = "Manage Workspace Trust";
+			const choice = await window.showInformationMessage("For security concern, Java language server cannot be switched to Standard mode in untrusted workspaces.", button);
+			if (choice === button) {
+				commands.executeCommand("workbench.trust.manage");
+			}
+			return;
+		}
+
+		const clientStatus: ClientStatus = standardClient.getClientStatus();
+		if (clientStatus === ClientStatus.starting || clientStatus === ClientStatus.started) {
+			return;
+		}
+
+		const api: ExtensionAPI = apiManager.getApiInstance();
+		if (api.serverMode === switchTo || api.serverMode === ServerMode.standard) {
+			return;
+		}
+
+		let choice: string;
+		if (force) {
+			choice = "Yes";
+		} else {
+			choice = await window.showInformationMessage("Are you sure you want to switch the Java language server to Standard mode?", "Yes", "No");
+		}
+
+		if (choice === "Yes") {
+			await startStandardServer(context, requirements, clientOptions, workspacePath, resolve);
+		}
 	});
+
+	context.subscriptions.push(snippetCompletionProvider.initialize());
+	context.subscriptions.push(serverStatusBarProvider);
+	context.subscriptions.push(runtimeStatusBarProvider);
+
+	registerClientProviders(context, { contentProviderEvent: jdtEventEmitter.event });
+
+	apiManager.getApiInstance().onDidServerModeChange((event: ServerMode) => {
+		if (event === ServerMode.standard) {
+			syntaxClient.stop();
+			fileEventHandler.setServerStatus(true);
+			runtimeStatusBarProvider.initialize(context);
+		}
+		commands.executeCommand('setContext', 'java:serverMode', event);
+	});
+
+	if (serverMode === ServerMode.hybrid && !await fse.pathExists(path.join(workspacePath, ".metadata", ".plugins"))) {
+		const config = getJavaConfiguration();
+		const importOnStartupSection: string = "project.importOnFirstTimeStartup";
+		const importOnStartup = config.get(importOnStartupSection);
+		if (importOnStartup === "disabled" ||
+			env.uiKind === UIKind.Web && env.appName.includes("Visual Studio Code")) {
+			apiPromises.push(syntaxClient.resolveApi().then(resolvedApi => {
+				if (!api) {
+					api = resolvedApi;
+				}
+			}));
+			requireStandardServer = false;
+		} else if (importOnStartup === "interactive" && await workspaceContainsBuildFiles()) {
+			apiPromises.push(syntaxClient.resolveApi().then((resolvedApi) => {
+				if (!api) {
+					api = resolvedApi;
+				}
+			}));
+			requireStandardServer = await promptUserForStandardServer(config);
+		} else {
+			requireStandardServer = true;
+		}
+	}
+
+	if (requireStandardServer) {
+		await startStandardServer(context, requirements, clientOptions, workspacePath, resolve);
+	}
+
+	const onDidGrantWorkspaceTrust = (workspace as any).onDidGrantWorkspaceTrust;
+	if (onDidGrantWorkspaceTrust !== undefined) { // keep compatibility for old engines < 1.56.0
+		context.subscriptions.push(onDidGrantWorkspaceTrust(() => {
+			if (getJavaServerMode() !== ServerMode.lightWeight) {
+				// See the issue https://github.com/redhat-developer/vscode-java/issues/1994
+				// Need to recollect the Java bundles before starting standard mode.
+				let pollingCount: number = 0;
+				// Poll every ~100ms (timeout after 1s) and check whether contributing javaExtensions have changed.
+				const intervalId = setInterval(() => {
+					const existingJavaExtensions = clientOptions.initializationOptions.bundles;
+					clientOptions.initializationOptions.bundles = collectJavaExtensions(extensions.all);
+					if (++pollingCount >= 10 || isContributedPartUpdated(existingJavaExtensions, clientOptions.initializationOptions.bundles)) {
+						clearInterval(intervalId);
+						commands.executeCommand(Commands.SWITCH_SERVER_MODE, ServerMode.standard, true);
+						return;
+					}
+				}, 100);
+			}
+		}));
+	}
+	context.subscriptions.push(workspace.onDidChangeTextDocument(event => handleTextBlockClosing(event.document, event.contentChanges)));
+
+	await Promise.race(apiPromises);
+	return api;
 }
 
-async function startStandardServer(context: ExtensionContext, requirements: requirements.RequirementsData, clientOptions: LanguageClientOptions, workspacePath: string, resolve: (value?: ExtensionAPI | PromiseLike<ExtensionAPI>) => void) {
+async function startStandardServer(context: ExtensionContext, requirements: RequirementsData, clientOptions: LanguageClientOptions, workspacePath: string, resolve: (value?: ExtensionAPI | PromiseLike<ExtensionAPI>) => void) {
 	if (standardClient.getClientStatus() !== ClientStatus.uninitialized) {
 		return;
 	}

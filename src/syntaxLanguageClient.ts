@@ -9,6 +9,7 @@ import { ClientStatus, ExtensionAPI } from "./extension.api";
 import { logger } from "./log";
 import { OutputInfoCollector } from "./outputInfoCollector";
 import { StatusNotification } from "./protocol";
+import { RequirementsData } from "./requirements";
 import { ServerMode } from "./settings";
 import { snippetCompletionProvider } from "./snippetCompletionProvider";
 import { getJavaConfig } from "./utils";
@@ -19,7 +20,7 @@ export class SyntaxLanguageClient {
 	private languageClient: LanguageClient;
 	private status: ClientStatus = ClientStatus.uninitialized;
 
-	public initialize(requirements, clientOptions: LanguageClientOptions, resolve: (value: ExtensionAPI) => void, serverOptions?: ServerOptions) {
+	public async initialize(requirements: RequirementsData, clientOptions: LanguageClientOptions, serverOptions?: ServerOptions): Promise<ExtensionAPI> {
 		const newClientOptions: LanguageClientOptions = Object.assign({}, clientOptions, {
 			middleware: {
 				workspace: {
@@ -56,9 +57,10 @@ export class SyntaxLanguageClient {
 		if (serverOptions) {
 			this.languageClient = new LanguageClient('java', extensionName, serverOptions, newClientOptions);
 
+			await this.languageClient.onReady();
 			// TODO: Currently only resolve the promise when the server mode is explicitly set to lightweight.
 			// This is to avoid breakings
-			this.languageClient.onReady().then(() => {
+			await new Promise<void>((resolve, reject) => {
 				this.languageClient.onNotification(StatusNotification.type, (report) => {
 					switch (report.type) {
 						case 'Started':
@@ -75,10 +77,11 @@ export class SyntaxLanguageClient {
 							break;
 					}
 					if (apiManager.getApiInstance().serverMode === ServerMode.lightWeight) {
-						this.resolveApiOnReady(resolve);
+						resolve();
 					}
 				});
 			});
+			return this.resolveApiOnReady();
 		}
 
 		this.status = ClientStatus.initialized;
@@ -91,7 +94,7 @@ export class SyntaxLanguageClient {
 		}
 	}
 
-	public stop(): Promise<void> {
+	public async stop(): Promise<void> {
 		this.status = ClientStatus.stopping;
 		if (this.languageClient) {
 			try {
@@ -100,7 +103,6 @@ export class SyntaxLanguageClient {
 				this.languageClient = null;
 			}
 		}
-		return Promise.resolve();
 	}
 
 	public isAlive(): boolean {
@@ -111,15 +113,15 @@ export class SyntaxLanguageClient {
 		return this.languageClient;
 	}
 
-	public resolveApi(resolve: (value: ExtensionAPI) => void): void {
+	public async resolveApi(): Promise<ExtensionAPI> {
 		apiManager.getApiInstance().serverMode = ServerMode.lightWeight;
 		apiManager.fireDidServerModeChange(ServerMode.lightWeight);
-		this.resolveApiOnReady(resolve);
+		return this.resolveApiOnReady();
 	}
 
-	private resolveApiOnReady(resolve: (value: ExtensionAPI) => void): void {
+	private async resolveApiOnReady(): Promise<ExtensionAPI> {
 		if ([ClientStatus.started, ClientStatus.error].includes(this.status)) {
-			resolve(apiManager.getApiInstance());
+			return apiManager.getApiInstance();
 		}
 	}
 }
